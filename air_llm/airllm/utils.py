@@ -101,29 +101,57 @@ def default_device():
     return "cpu"
 
 
-def uncompress_layer_state_dict(layer_state_dict):
+def _decompress_device(device):
+    """Device to run a block-wise dequantization on.
+
+    bitsandbytes' dequantize kernels are CUDA-only (an MPS build falls back to plain torch
+    anyway), so on a machine without CUDA there is no choice to make. Everywhere else the
+    caller's device is used instead of a hardcoded ``cuda`` -- which used to send a CPU-only run
+    straight to an assertion error, making the 4bit/8bit codecs unusable off NVIDIA hardware.
+    """
+    if device is not None:
+        resolved = torch.device(device)
+        if resolved.type == 'cuda' and torch.cuda.is_available():
+            return str(resolved)
+        if resolved.type == 'cpu' and not torch.cuda.is_available():
+            return 'cpu'
+    return default_device()
+
+
+def uncompress_layer_state_dict(layer_state_dict, device=None):
+    """Expand 4bit/8bit block-quantized shards into full-precision tensors.
+
+    ``device`` is where the dequantization runs (and where the result ends up). It defaults to
+    the best available device, matching this module's other entry points instead of assuming CUDA.
+    """
+    if not layer_state_dict:
+        return layer_state_dict
+    if not any(('4bit' in k or '.8bit.' in k) for k in layer_state_dict):
+        return layer_state_dict
+
+    target = _decompress_device(device)
     uncompressed_layer_state_dict = None
     if any(['4bit' in k for k in layer_state_dict.keys()]):
         uncompressed_layer_state_dict = {}
         for k, v in layer_state_dict.items():
             if '4bit' not in k:
                 quant_state_dict = {kk[len(k):]: kv for kk, kv in layer_state_dict.items() if kk.startswith(k) and k != kk}
-                quant_state = bnb.functional.QuantState.from_dict(qs_dict=quant_state_dict, device="cuda")
+                quant_state = bnb.functional.QuantState.from_dict(qs_dict=quant_state_dict, device=target)
 
-                dqv = bnb.functional.dequantize_nf4(v.cuda(), quant_state)
+                dqv = bnb.functional.dequantize_nf4(v.to(target), quant_state)
                 uncompressed_layer_state_dict[k] = dqv
         del layer_state_dict
     elif any(['8bit' in k for k in layer_state_dict.keys()]):
         uncompressed_layer_state_dict = {}
         for k, v in layer_state_dict.items():
-            if '8bit' not in k:
+            if '.8bit.' not in k:
 
                 absmax = layer_state_dict[k + ".8bit.absmax"]
                 code = layer_state_dict[k + ".8bit.code"]
 
-                dqv = bnb.functional.dequantize_blockwise(v.cuda(),
-                                                          bnb.functional.QuantState(absmax=absmax.cuda(),
-                                                                                    code=code.cuda(),
+                dqv = bnb.functional.dequantize_blockwise(v.to(target),
+                                                          bnb.functional.QuantState(absmax=absmax.to(target),
+                                                                                    code=code.to(target),
                                                                                     blocksize=2048,
                                                                                     dtype=torch.float16))
                 uncompressed_layer_state_dict[k] = dqv
@@ -483,19 +511,28 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None
                                       f"existing space under {checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path} assuming can reuse: {total_saved_split_files_size_bytes/ 1024 / 1024 / 1024:.02f}GB. "
                                       )
 
-def compress_layer_state_dict(layer_state_dict, compression=None):
+def compress_layer_state_dict(layer_state_dict, compression=None, device=None):
+    """Block-wise quantize shards on the way to disk.
+
+    ``device`` defaults to the best available one. It used to be a hardcoded ``.cuda()``, which
+    made ``compression=`` unusable anywhere without an NVIDIA driver even though bitsandbytes
+    ships CPU kernels for both schemes.
+    """
+    if compression is None or not layer_state_dict:
+        return layer_state_dict
+    target = _decompress_device(device)
     compressed_layer_state_dict = None
     if compression == '4bit':
         compressed_layer_state_dict = {}
         for k, v in layer_state_dict.items():
-            v_quant, quant_state = bnb.functional.quantize_nf4(v.cuda(), blocksize=64)
+            v_quant, quant_state = bnb.functional.quantize_nf4(v.to(target), blocksize=64)
             compressed_layer_state_dict[k] = v_quant
             for quant_state_k, quant_state_v in save_quant_state_to_dict(quant_state).items():
                 compressed_layer_state_dict[k + ".4bit." + quant_state_k] = quant_state_v
     elif compression == '8bit':
         compressed_layer_state_dict = {}
         for k, v in layer_state_dict.items():
-            v_quant, quant_state = bnb.functional.quantize_blockwise(v.cuda(), blocksize=2048)
+            v_quant, quant_state = bnb.functional.quantize_blockwise(v.to(target).to(torch.float16), blocksize=2048)
             absmax = quant_state.absmax.clone().contiguous()
             code = quant_state.code.clone().contiguous()
             compressed_layer_state_dict[k] = v_quant

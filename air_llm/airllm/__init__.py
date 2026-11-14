@@ -15,6 +15,16 @@ else:
     from .auto_model import AutoModel
     from .utils import split_and_save_layers
     from .utils import NotEnoughSpaceException
+    # The 4bit/8bit block-wise compression helpers. These were only reachable through
+    # ``airllm.utils``, which broke ``from airllm import uncompress_layer_state_dict`` (the
+    # documented way to inspect a compressed shard) and the project's own compression test.
+    from .utils import compress_layer_state_dict, uncompress_layer_state_dict
+    # The codec engine: the lossless/lossy compression layer and the planner that picks between
+    # them. Exported so callers can size a checkpoint before downloading it (``suggest_codec``,
+    # ``estimate_bytes``) and so a shard can be inspected without going through a model.
+    from .codecs import (LOSSLESS_CODECS, SUPPORTED_CODECS, Plan, decode_state_dict,
+                         encode_state_dict, estimate_bytes, plan_codecs, read_codec_meta,
+                         savings_report, suggest_codec)
 
     # Dedicated subclasses for a handful of custom-architecture models. Some of them pull in
     # optional extras (e.g. the Baichuan tokenizer needs `sentencepiece`). Import them defensively
