@@ -81,7 +81,11 @@ class AutoModel:
             "the generic engine. Hand-written classes exist for: " + dedicated + ".\n"
             "Verified end-to-end (output matches transformers token for token): Llama/Mistral/Qwen2/"
             "Qwen3, Gemma, Phi, GPT-2, GPT-NeoX, GPT-J, GPT-BigCode, OPT, BLOOM, Falcon, StableLM, "
-            "Cohere, OLMo and anything sharing their decoder layout."
+            "Cohere, OLMo and anything sharing their decoder layout.\n"
+            "Sparse MoE models (Mixtral, Qwen2/Qwen3-MoE, DeepSeek, Kimi K3) stream too, but only "
+            "models that keep each expert in its own module get per-expert loading; the packed "
+            "layout current transformers uses streams the whole layer. The layout found for a given "
+            "model is printed when it loads."
         )
 
     @classmethod

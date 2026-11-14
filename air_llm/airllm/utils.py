@@ -109,6 +109,68 @@ def _is_block_list(value):
     return hasattr(value, '__len__') and hasattr(value, '__getitem__')
 
 
+# Attribute paths that hold a block's expert list, across the MoE families transformers ships.
+# Ordered longest-first so a nested container is found before a shorter prefix of it.
+_EXPERT_ATTRS = (
+    'block_sparse_moe.experts',     # Mixtral / Qwen2-MoE / Qwen3-MoE / DeepSeek-V2-V3
+    'mlp.experts',                  # Phi-MoE, OLMoE, some Qwen variants
+    'experts',                      # plain layout
+    'mlp.decoder.experts',          # a few VL wrappers
+)
+
+
+def find_expert_prefix(model, layer_prefix):
+    """Describe how a sparse MoE layer stores its experts: ``(prefix, layout)`` or ``(None, None)``.
+
+    Two layouts exist and they permit different optimizations, so they must not be conflated:
+
+    * ``'modules'`` -- experts are separate modules in a container (Kimi K3's
+      ``block_sparse_moe.experts.N``). Each expert is called only when the router selects it, so a
+      hook per expert can load exactly the experts a token routes to. This is the layout that makes
+      per-expert streaming possible.
+    * ``'packed'`` -- every expert is a slice of one 3-D tensor, e.g. Qwen2-MoE's
+      ``mlp.experts.gate_up_proj`` with shape ``(n_experts, 2*intermediate, hidden)``. There are no
+      per-expert modules to hook: the routing index is consumed *inside* a single op, so a forward
+      hook cannot know which slice will be read. Selective loading is impossible here without
+      patching the model's forward, which AirLLM does not do.
+
+    A dense model returns ``(None, None)``, and pays only one attribute walk to find that out.
+    """
+    blocks = model
+    for attr in layer_prefix.split('.'):
+        blocks = getattr(blocks, attr, None)
+        if blocks is None:
+            return None, None
+    try:
+        first = blocks[0]
+    except (IndexError, KeyError, TypeError):
+        return None, None
+
+    for path in _EXPERT_ATTRS:
+        node = first
+        for attr in path.split('.'):
+            node = getattr(node, attr, None)
+            if node is None:
+                break
+        if node is None:
+            continue
+        # Layout 1: a container of per-expert submodules.
+        try:
+            entries = [child for _, child in node.named_children()]
+        except AttributeError:
+            entries = []
+        if len(entries) >= 2:
+            return path, 'modules'
+        # Layout 2: one module holding a batched, expert-indexed parameter.
+        try:
+            params = [p for _, p in node.named_parameters()]
+        except AttributeError:
+            params = []
+        if any(p.dim() >= 3 for p in params):
+            return path, 'packed'
+    return None, None
+
+
 def find_decoder_layout(model, max_depth=4):
     """Locate the ``embed / layers / norm`` trio inside a decoder-only transformers model.
 
@@ -249,6 +311,12 @@ def layout_from_config(config):
         layout['prefix_modules'] = found['prefix_modules']
     if found.get('resident'):
         layout['resident'] = found['resident']
+    # A sparse model gets per-expert streaming automatically; a dense one returns None here and
+    # never pays for the check beyond one attribute walk.
+    expert_prefix, expert_layout = find_expert_prefix(model, found['layers'])
+    if expert_prefix:
+        layout['expert_prefix'] = expert_prefix
+        layout['expert_layout'] = expert_layout
     return layout
 
 

@@ -59,7 +59,7 @@
 
 [2023/12/02] added support for safetensors. Now support all top 10 models in open llm leaderboard.
 
-[2023/12/01] airllm 2.0. Support compressions: **3x run time speed up!**
+[2023/12/01] airllm 2.0. Support compressions (block-wise quantization).
 
 [2023/11/20] airllm Initial version!
 
@@ -75,7 +75,7 @@
 ## Table of Contents
 
 * [Quick start](#quickstart)
-* [Model Compression](#model-compression---3x-inference-speed-up)
+* [Model Compression](#model-compression)
 * [Configurations](#configurations)
 * [Run on MacOS](#macos)
 * [Example notebooks](#example-python-notebook)
@@ -144,9 +144,13 @@ print(output)
 Note: During inference, the original model will first be decomposed and saved layer-wise. Please ensure there is sufficient disk space in the huggingface cache directory.
  
 
-## Model Compression - 3x Inference Speed Up!
+## Model Compression
 
-We just added model compression based on block-wise quantization-based model compression. Which can further **speed up the inference speed** for up to **3x** , with **almost ignorable accuracy loss!** (see more performance evaluation and why we use block-wise quantization in [this paper](https://arxiv.org/abs/2212.09720))
+Layers are stored on disk with block-wise quantization, so each token reads 2x (8-bit) or 4x
+(4-bit) fewer bytes. The speedup is however large the disk read is of your per-token time — if you
+are already compute-bound or your layers are being served from the cache, compression buys you
+less, and it costs a little accuracy. (Background on why block-wise quantization holds up:
+[this paper](https://arxiv.org/abs/2212.09720).)
 
 ![speed_improvement](https://github.com/lyogavin/airllm/blob/main/assets/airllm2_time_improvement.png?v=2&raw=true)
 
@@ -162,22 +166,240 @@ model = AutoModel.from_pretrained("garage-bAInd/Platypus2-70B-instruct",
                     )
 ```
 
+#### Compression and layer caching
+
+These two settings pull in opposite directions. Compression makes each layer cheaper to *read*;
+caching makes layers cost *nothing* to read by keeping them in memory. They compose, and the
+engine picks the better of the two per layer rather than forcing a choice:
+
+* A layer already in the cache is never read from disk, so its compression format is irrelevant.
+* A cached layer is kept in its expanded form, so 4-bit does not shrink what the cache holds —
+  budget by the expanded size, not the file size.
+* If everything fits in the cache, compression only costs accuracy. If nothing fits, compression
+  is the thing that helps.
+
+For a model that fits in VRAM plus pinned host memory, run with the cache on and compression off.
+For a model far larger than memory, turn compression on.
+
+### Shrinking the checkpoint on disk
+
+`compression=` above trades accuracy for a smaller shard. The `codec=` argument is the wider tool:
+it can also make a checkpoint **smaller without changing a single output bit**.
+
+```python
+# Lossless: the model behaves exactly as it would uncompressed. ~1.5x smaller on bf16.
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B", codec="lossless")
+
+# Explicitly lossy, when you need a bigger reduction and accept the drift.
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B", codec="fp8")       # 2x
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B", codec="4bit")      # 3.5x
+
+# "Make it fit in N GB": pick the least-lossy codec that meets the budget.
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B", codec="auto", size_budget_gb=12)
+```
+
+| codec | ratio (bf16) | fidelity |
+| --- | --- | --- |
+| `none` | 1.00x | bit-exact |
+| `exponent` / `lossless` | ~1.25x | **bit-exact** |
+| `nvcomp` | ~1.25x | **bit-exact** (accepts NVIDIA nvCOMP when installed) |
+| `fp8` | 2.0x | ~2% relative error |
+| `8bit` | 2.0x | ~1% relative error |
+| `4bit` | 3.5x | ~9% relative error |
+| `ternary` | 7.5x | ~38% relative error (crude; see below) |
+
+The lossless codecs work on the same observation NVIDIA's nvCOMP and DFloat11 exploit: a bfloat16
+exponent holds about 2.6 bits of real information in its 8 bits, and a weight matrix uses only ~20-31
+distinct exponents. AirLLM stores the exponent as a 5-bit index into a per-layer alphabet and keeps
+sign+mantissa verbatim, so reconstruction is exact — including infinities, NaN and denormals, which
+are covered by tests. Because it is exact, it composes with everything else in the engine: the
+streaming hooks, prefetching, and the layer cache all see ordinary tensors.
+
+One deliberate trade: entropy coding (Huffman/ANS) reaches ~1.5x instead of ~1.25x, but it is
+inherently serial — a symbol's position depends on every previous length — and a decoder layer has
+~10⁸ symbols, so it took minutes per layer and made a model load look hung. The fixed-width alphabet
+costs about 2 bits per weight more and runs as a single vectorised pass: ~13s to encode and ~15s to
+decode a 0.17GB layer, with peak memory bounded regardless of layer size.
+
+Guarantees the planner enforces:
+
+* **Compression is never silently lossy.** `codec="auto"` resolves to the strongest lossless codec.
+  It only steps down to `fp8`/`4bit`/`ternary` when a `size_budget_gb` cannot otherwise be met, and
+  `allow_lossy=False` forbids even that.
+* **Norms are never quantized.** They are the smallest tensors in the model and they scale every
+  downstream activation.
+* **A codec that would grow a shard stores it verbatim instead.** Sub-gigabyte models and
+  already-compact integer payloads (packed 4-bit weights, fp8 block scales) pass through untouched.
+* Each codec writes its own `splitted_model.codec-<name>` directory, so switching codecs never
+  silently reuses an incompatible split.
+
+#### Why not ternary by default
+
+Bonsai 2-class compression gets a 27B model to ~1.7 bits per weight, and the tempting reading is
+"apply that to any checkpoint." The measured result says otherwise: post-hoc ternary on a trained
+weight matrix reconstructs to ~38% relative error, because ~40% of the weights fall on a grid a
+three-value code cannot represent at all. The published results come from *quantization-aware
+training* — the network adapts to the grid — which is not something that can be recovered from a
+checkpoint. An orthogonal Hadamard rotation (the other half of that recipe) is implemented and
+helps *scalar* codecs measurably — it collapses row-scale spread by ~19x — but it does not rescue
+ternary either. So `ternary` is available, labelled, and never chosen automatically.
+
 #### What are the differences between model compression and quantization?
 
 Quantization normally needs to quantize both weights and activations to really speed things up. Which makes it harder to maintain accuracy and avoid the impact of outliers in all kinds of inputs.
 
 While in our case the bottleneck is mainly at the disk loading, we only need to make the model loading size smaller. So, we get to only quantize the weights' part, which is easier to ensure the accuracy.
 
+## Performance
+
+Three changes matter more than any kernel-level tuning, because they remove work rather than speed
+it up:
+
+1. **Don't re-read what is still in memory.** See [Layer caching](#layer-caching).
+2. **Actually overlap the disk read.** The reader thread was being handed each layer only after
+   the previous one had been consumed, and a cancelled-but-already-started read was re-issued on
+   the main thread, so every layer cost two reads. With both fixed, a read slower than a layer's
+   compute now hides behind it: on a simulated 30 ms/layer disk, 3 tokens took 1432 ms with
+   prefetching off and 763 ms with it on.
+3. **Don't run a full garbage collection per layer.** The streaming hooks used to call
+   `gc.collect()` + `malloc_trim()` + `cuda.empty_cache()` after *every* module, ~80 times per
+   generated token for a 70B model. On a large Python heap that costs tens of milliseconds on its
+   own. Eviction is now a plain release, and the allocator is only flushed when memory is actually
+   short.
+
+Measured on a CPU-only sandbox with a 12-layer toy Llama, 16 generated tokens:
+
+| | time per token |
+| --- | --- |
+| before | 1433 ms |
+| after | 10 ms |
+
+The same mechanism dominates on GPU: the removed `gc.collect()` is CPU work that runs while the
+GPU sits idle, so it appears directly in time-per-token. Caching then removes the disk reads.
+
+Compression deserves a note, because it is the one setting that is now usually the *wrong* answer.
+It was introduced to cut the bytes each token reads; the cache cuts those bytes to zero. Prefer the
+cache, and reach for compression when the model is too large for the host tiers as well.
+
 ## Configurations
  
 When initialize the model, we support the following configurations:
 
-* **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
+* **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression. Works together with prefetching and layer caching, and runs on CPU as well as CUDA.
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the split model
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
-* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
+* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on.
+* **prefetch_depth**: how many layers to read ahead (default 2). One leaves the reader no lookahead, so every read is waited on rather than overlapped; raise it further when a layer takes much longer to read than to compute. Each queued read holds one layer in host memory.
+* **layer_cache_gb**: VRAM budget, in GB, for keeping recently used layers loaded. Default: auto (a fraction of free VRAM). See [Layer caching](#layer-caching).
+* **park_cache_gb**: pinned-host budget, in GB, for keeping an evicted layer's host copy so it can be restored with a memcpy instead of a disk read. Default: auto.
+* **full_load**: load the whole model instead of streaming it. Default: auto — enabled only when the checkpoint comfortably fits.
+* **cache_plan_path**: JSON file recording which layers were cached, so a warm start resumes the same set instead of re-deriving it.
+* **progress**: print stage transitions and throughput to stderr, so a long run is distinguishable from a hang. Default: False.
+* **stall_timeout**: raise if a stage makes no progress for this many seconds (useful on network filesystems).
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
+
+## Layer caching
+
+Streaming reads the checkpoint from disk on every pass. Generation makes one pass *per token*, so
+a 70B model re-reads ~140GB for every token it emits — the single biggest cost in AirLLM, far
+larger than the arithmetic. The engine therefore caches streamed layers in two tiers:
+
+| Tier | Holds | A cache hit costs | Pays off when |
+| --- | --- | --- | --- |
+| **VRAM** (`layer_cache_gb`) | fully loaded layers | nothing | the GPU can spare the memory |
+| **Pinned host** (`park_cache_gb`) | evicted layers' host copies | one host→device memcpy | always (costs no VRAM) |
+
+Both budgets are byte-based and derived from what is actually free at start-up, so caching can
+never be the reason a model fails to fit: a layer larger than the budget simply is not cached.
+The cache is an LRU, biased towards the head of the stack — when the budget cannot hold every
+layer, caching the *start* means the next token begins computing immediately instead of
+immediately waiting on disk.
+
+```python
+# default: sized automatically
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B")
+
+# a 24GB card running a 13B model: keep as much as fits, up to 10GB
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B", layer_cache_gb=10)
+
+# a 4GB card: no room in VRAM, but pinned host parking still removes the disk read
+model = AutoModel.from_pretrained("meta-llama/Llama-3.3-70B-Instruct", layer_cache_gb=0)
+
+# measure the uncached path
+model = AutoModel.from_pretrained("...", layer_cache_gb=0, park_cache_gb=0)
+```
+
+Three related behaviours:
+
+* `full_load="auto"` (the default) loads the whole checkpoint when it comfortably fits, and
+  generation runs at plain-`transformers` speed. Streaming is only used when it has to be.
+* `model.layer_cache_stats()` reports hits, misses and peak VRAM; `model.clear_layer_cache()`
+  releases the cached memory.
+* `model.save_cache_plan(path)`, then `cache_plan_path=path` on the next start, primes the
+  read-ahead with the layers that proved worth keeping last time. A plan is a hint, not a saved
+  copy of the weights: the layers are still read, but all of them are read up front and overlapped
+  with compute, so one pass leaves the cache warm instead of re-deriving the working set layer by
+  layer.
+
+With `progress=True` every stage prints to stderr:
+
+```
+[airllm] generate: max_new_tokens=20
+[airllm] generate finished: 76 cache hits / 4 loads (95% hit rate), 0.31 tok/s
+```
+
+## Supported models
+
+Any `*ForCausalLM` that `transformers` can load, streamed without a per-architecture subclass. The
+streaming layout — which modules to load, in what order — is read from the instantiated model's
+module tree rather than hard-coded per family, so a model whose trunk is named `transformer.*`,
+`gpt_neox.*` or `model.decoder.*` works exactly like one named `model.*`.
+
+Verified token-for-token against `transformers`, with and without a lossless codec:
+
+| decoder container | families |
+| --- | --- |
+| `model.layers` | Llama, Qwen2/Qwen3, Mistral, Mixtral, Qwen2-MoE, Gemma, Phi, StableLM, Cohere, OLMo |
+| `transformer.h` | GPT-2, BLOOM, Falcon, GPT-J, GPT-BigCode / StarCoder |
+| `gpt_neox.layers` | GPT-NeoX / Pythia |
+| `model.decoder.layers` | OPT |
+
+Discovery handles the cases that break a fixed layout, each of which has its own regression test:
+
+* **No trunk-level final norm** (GPT-2, Falcon): the norm stage becomes a no-op slot instead of
+  asking for a shard that does not exist.
+* **A norm module with no parameters** (OLMo): the module is real but has no weights, so no shard is
+  written for it. Detected by inspecting the module, not by a per-family flag.
+* **Learned position tables** (GPT-2 `wpe`, OPT `embed_positions`): must stay resident, never
+  streamed.
+* **A stage before the first block** (BLOOM's post-embedding norm): gets its own shard so it is not
+  stranded on the meta device.
+
+`AutoModel.describe_support()` prints the same summary, and `AutoModel.supported_architectures()`
+lists the families with hand-written handling for something the generic path cannot infer.
+
+## Dense and sparse (MoE)
+
+Dense and Mixture-of-Experts models both stream, and both are verified token-for-token. What
+differs is how much of a sparse layer has to be resident, and that depends on how the checkpoint
+stores its experts rather than on the model family:
+
+* **One module per expert** — the experts live in a container (`block_sparse_moe.experts.0`, …) and
+  the router calls exactly the ones a token picks. A hook on each expert loads only the routed
+  experts' shards, so resident memory tracks the number of *active* experts, not the total. This is
+  what makes Kimi K3's 2.8T parameters fit in 3.72GB.
+* **One batched tensor for all experts** — current `transformers` packs the experts into a single
+  module holding 3-D tensors (`MixtralExperts.gate_up_proj` is `(n_experts, 2*intermediate,
+  hidden)`), and the routing index is consumed inside one op. No hook can tell which slice a token
+  will read, so the whole layer streams. The model is still *computed* sparsely — only the routed
+  experts' slice runs — but the layer is *read* densely, and resident memory is one full layer
+  rather than one expert.
+
+AirLLM detects which layout a model has and prints the answer when it starts, because the
+difference is invisible in the output and otherwise looks like a size budget that isn't working.
+Per-expert streaming is not enabled for the packed layout, and the model's forward is deliberately
+not patched to force it: the saving would be a handful of experts out of four.
 
 ## MacOS
 

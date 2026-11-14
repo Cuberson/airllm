@@ -27,7 +27,7 @@ if 'airllm' not in sys.modules:
     _pkg.__path__ = [str(_AIRLLM_DIR)]
     sys.modules['airllm'] = _pkg
 
-from airllm.utils import find_decoder_layout, layout_from_config  # noqa: E402
+from airllm.utils import find_decoder_layout, find_expert_prefix, layout_from_config  # noqa: E402
 from airllm.airllm_base import AirLLMBaseModel  # noqa: E402,F401
 
 
@@ -66,8 +66,8 @@ def _configs():
     """
     from transformers import (BloomConfig, CohereConfig, FalconConfig, GPT2Config,
                               GPTBigCodeConfig, GPTJConfig, GPTNeoXConfig, GemmaConfig,
-                              MistralConfig, OPTConfig, OlmoConfig, PhiConfig, Qwen2Config,
-                              StableLmConfig)
+                              MixtralConfig, MistralConfig, OPTConfig, OlmoConfig, PhiConfig,
+                              Qwen2Config, Qwen2MoeConfig, StableLmConfig)
     common = dict(num_hidden_layers=2, num_attention_heads=4)
     hidden = dict(hidden_size=64, intermediate_size=128, num_key_value_heads=4,
                   max_position_embeddings=128)
@@ -92,6 +92,13 @@ def _configs():
         # The ``transformer.h`` convention shared by GPT-J and StarCoder.
         'gptj': GPTJConfig(vocab_size=VOCAB, n_embd=64, n_layer=2, n_head=4, rotary_dim=8),
         'gptbigcode': GPTBigCodeConfig(vocab_size=VOCAB, n_embd=64, n_layer=2, n_head=4),
+        # Sparse: the layer is mostly experts, of which a token touches a few.
+        'mixtral': MixtralConfig(vocab_size=VOCAB, num_local_experts=4, num_experts_per_tok=2,
+                                 **common, **hidden),
+        'qwen2_moe': Qwen2MoeConfig(vocab_size=VOCAB, moe_intermediate_size=64,
+                                    shared_expert_intermediate_size=64, num_experts=4,
+                                    num_experts_per_tok=2, decoder_sparse_step=1,
+                                    norm_topk_prob=True, **common, **hidden),
     }
 
 
@@ -119,6 +126,9 @@ class TestLayoutDiscovery(unittest.TestCase):
         'gptj': {'embed': 'transformer.wte', 'layers': 'transformer.h', 'norm': 'transformer.ln_f'},
         'gptbigcode': {'embed': 'transformer.wte', 'layers': 'transformer.h',
                        'norm': 'transformer.ln_f'},
+        'mixtral': {'embed': 'model.embed_tokens', 'layers': 'model.layers', 'norm': 'model.norm'},
+        'qwen2_moe': {'embed': 'model.embed_tokens', 'layers': 'model.layers',
+                      'norm': 'model.norm'},
     }
 
     def test_each_family_resolves_its_own_container_names(self):
@@ -151,6 +161,47 @@ class TestLayoutDiscovery(unittest.TestCase):
         self.assertEqual(layout['norm'], 'model.norm')
         # The default layout already points here, so nothing extra should be invented.
         self.assertFalse(layout.get('prefix_modules'))
+
+
+class TestSparseMoELayout(unittest.TestCase):
+    """Dense and sparse models must both stream; sparse has two expert layouts to tell apart.
+
+    The distinction matters because it decides whether selective loading is possible at all, and a
+    wrong answer is invisible in the output: a packed-expert model streamed whole-layer computes the
+    same tokens as one streamed per expert, it just reads the entire layer instead of the few
+    experts a token routes to.
+    """
+
+    def _build(self, config):
+        from accelerate import init_empty_weights
+        from transformers import AutoModelForCausalLM
+        with init_empty_weights(include_buffers=False):
+            return AutoModelForCausalLM.from_config(config)
+
+    def test_dense_models_report_no_experts(self):
+        model = self._build(_configs()['mistral'])
+        self.assertEqual(find_expert_prefix(model, 'model.layers'), (None, None))
+
+    def test_every_family_is_classified(self):
+        """No family may fall through the detector without being explicitly one or the other."""
+        for name, config in _configs().items():
+            with self.subTest(family=name):
+                model = self._build(config)
+                layout = find_decoder_layout(model)
+                prefix, kind = find_expert_prefix(model, layout['layers'])
+                if name in ('mixtral', 'qwen2_moe'):
+                    self.assertIsNotNone(prefix, f"{name} is sparse but no expert container found")
+                    self.assertEqual(kind, 'packed',
+                                     "transformers 5.x batches experts into one 3-D tensor")
+                else:
+                    self.assertIsNone(prefix, f"{name} is dense but was classified sparse")
+
+    def test_sparse_layout_is_exposed_on_the_model(self):
+        """AutoModel reports the layout so a caller can see whether selective loading applies."""
+        from airllm.utils import layout_from_config
+        layout = layout_from_config(_configs()['qwen2_moe'])
+        self.assertEqual(layout.get('expert_layout'), 'packed')
+        self.assertEqual(layout.get('expert_prefix'), 'mlp.experts')
 
 
 class TestStreamingMatchesTransformers(unittest.TestCase):
