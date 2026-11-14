@@ -85,6 +85,173 @@ def clean_memory():
     torch.cuda.empty_cache()
 
 
+
+# ---------------------------------------------------------------------------------------------
+# streaming-layout discovery
+# ---------------------------------------------------------------------------------------------
+#
+# The default layout (``model.embed_tokens`` / ``model.layers`` / ``model.norm`` / ``lm_head``)
+# covers the Llama/Qwen/Mistral/Gemma family. Several very common architectures keep the same
+# decoder behind different attribute names -- GPT-NeoX, BLOOM, Falcon, GPT-2, OPT -- and asking
+# users to wait for a hand-written subclass meant they could not stream those checkpoints at all.
+# The splitter and the runtime both need the same answer, so discovery lives here.
+
+_EMBED_ATTRS = ('embed_tokens', 'embed_in', 'wte', 'word_embeddings', 'tok_embeddings')
+_NORM_ATTRS = ('norm', 'final_layernorm', 'ln_f', 'final_layer_norm')
+
+
+def _is_block_list(value):
+    """True for a list-like container of decoder blocks (ModuleList / Sequential / plain list)."""
+    if isinstance(value, (torch.nn.ModuleList, torch.nn.Sequential)):
+        return True
+    if isinstance(value, torch.nn.Module):
+        return False
+    return hasattr(value, '__len__') and hasattr(value, '__getitem__')
+
+
+def find_decoder_layout(model, max_depth=4):
+    """Locate the ``embed / layers / norm`` trio inside a decoder-only transformers model.
+
+    Every decoder-only transformer has the same two ingredients: a table mapping token ids to
+    vectors, and a list of repeating blocks fed by it. The parent of that list is the trunk
+    (``model``, ``transformer``, ``gpt_neox``), which is also where a final norm lives when there
+    is one.
+
+    Returns a dict of dotted attribute paths plus a ``score``, or None when nothing convincing was
+    found. Ties are broken towards trunk-level norms and towards the conventional container names,
+    so a model with several candidates (some VL wrappers nest a text model) picks the real stack.
+    """
+    best = None
+    seen = set()
+
+    def walk(module, prefix, depth):
+        nonlocal best
+        if depth > max_depth or id(module) in seen:
+            return
+        seen.add(id(module))
+        for name, child in module.named_children():
+            path = f'{prefix}.{name}' if prefix else name
+            if _is_block_list(child) and len(child) >= 1:
+                blocks_are_modules = all(isinstance(b, torch.nn.Module) for b in list(child)[:2])
+                embed = next((a for a in _EMBED_ATTRS if hasattr(module, a)), None)
+                if not blocks_are_modules or embed is None:
+                    continue
+                norm = next((a for a in _NORM_ATTRS if hasattr(module, a)), None)
+                score = (2 if norm else 0) + (1 if name in ('layers', 'h', 'blocks', 'block') else 0)
+                candidate = {
+                    'score': score,
+                    'layers': path,
+                    'embed': f'{prefix}.{embed}' if prefix else embed,
+                    'norm': (f'{prefix}.{norm}' if prefix else norm) if norm else None,
+                    'fallback_norm': f'{path}.0',
+                    'count': len(child),
+                    # Sibling tables (a learned position embedding) that the model needs before
+                    # the first block runs. Detected by name so no per-family list is required.
+                    # Trunk-level children that are neither the token embedding nor the final
+                    # norm. These run *between* the embedding and the first block, so they must
+                    # be present whenever the blocks run. Small lookup tables (GPT-2's learned
+                    # ``wpe``, OPT's learned positions) are kept resident: they are read on every
+                    # token and cost almost nothing. Anything else (BLOOM's post-embedding
+                    # layernorm, which is a top-level module rather than a block child) streams as
+                    # its own stage via ``prefix_modules``.
+                    'resident': [
+                        f'{prefix}.{attr}' if prefix else attr
+                        for attr, sub in module.named_children()
+                        if attr != embed and attr != norm
+                        and isinstance(sub, torch.nn.Embedding)
+                    ],
+                    'prefix_modules': [
+                        f'{prefix}.{attr}' if prefix else attr
+                        for attr, sub in module.named_children()
+                        if attr != embed and attr != norm
+                        and not _is_block_list(sub)
+                        and not isinstance(sub, torch.nn.Embedding)
+                        and any(True for _ in sub.parameters())
+                    ],
+                }
+                if best is None or candidate['score'] > best['score']:
+                    best = candidate
+                continue
+            walk(child, path, depth + 1)
+
+    walk(model, '', 0)
+    return best
+
+
+def derive_layer_names_dict(layer_names, config, saved_path):
+    """Return a layout that actually exists in a split checkpoint, discovering one if needed.
+
+    ``layer_names`` may come from an AirLLM subclass or from the default. If its modules are not
+    all present as shards under ``saved_path``, a layout is derived from ``config``'s architecture
+    (via a config-only model skeleton, so no weights are read) and used instead.
+    """
+    if layer_names is None or config is None:
+        return layer_names
+    if has_layout_shards(layer_names, saved_path):
+        return layer_names
+
+    layout = layout_from_config(config)
+    if layout is None:
+        return layer_names
+    print(f"derived streaming layout from {type(config).__name__}: "
+          + ", ".join(f"{k}={v!r}" for k, v in layout.items()))
+    merged = dict(layer_names)
+    for key, value in layout.items():
+        if key == 'resident':
+            # Never drop a tower a subclass declared just because discovery ran.
+            merged['resident'] = list(dict.fromkeys(list(merged.get('resident') or []) + list(value)))
+        else:
+            merged[key] = value
+    return merged
+
+
+def has_layout_shards(layer_names, saved_path):
+    """Whether a split directory actually contains the shards a layout expects."""
+    if layer_names is None:
+        return False
+    root = Path(saved_path)
+    for key in ('embed', 'layer_prefix', 'norm', 'lm_head'):
+        value = layer_names.get(key)
+        if not value:
+            return False
+        if not (root / (str(value) + '.safetensors')).exists() and \
+                not (root / (str(value) + 'safetensors')).exists():
+            return False
+    return True
+
+
+def layout_from_config(config):
+    """Build a config-only model skeleton and discover its decoder layout."""
+    try:
+        from transformers import AutoModelForCausalLM
+        from accelerate import init_empty_weights
+        with _force_meta_embeddings():
+            with init_empty_weights(include_buffers=False):
+                model = AutoModelForCausalLM.from_config(config, trust_remote_code=False)
+    except Exception:  # noqa: BLE001 - a layout hint is best-effort
+        return None
+    found = find_decoder_layout(model)
+    if found is None:
+        return None
+    layout = {'embed': found['embed'], 'layer_prefix': found['layers'], 'lm_head': 'lm_head'}
+    if found.get('norm'):
+        layout['norm'] = found['norm']
+    else:
+        # No trunk-level final norm (GPT-2). The streaming sequence still needs a slot in that
+        # position, so it points at a real child module and is marked stateless: the engine skips
+        # loading it and its hook is a no-op.
+        layout['norm'] = found['fallback_norm']
+        layout['stateless_norm'] = True
+    # Trunk-level stages between the embedding and the first block (BLOOM's post-embedding norm,
+    # GPT-2's learned position table). They stream as their own stage so nothing is stranded on
+    # the meta device, and are marked stateless when they hold no parameters.
+    if found.get('prefix_modules'):
+        layout['prefix_modules'] = found['prefix_modules']
+    if found.get('resident'):
+        layout['resident'] = found['resident']
+    return layout
+
+
 def default_device():
     """Pick the best device available, instead of assuming CUDA.
 
@@ -101,13 +268,70 @@ def default_device():
     return "cpu"
 
 
+# ---------------------------------------------------------------------------------------------
+# device / host memory introspection, used to size AirLLM's layer caches
+# ---------------------------------------------------------------------------------------------
+
+def free_device_bytes(device=None):
+    """Bytes currently free on ``device``, or None when it cannot be determined.
+
+    ``torch.cuda.mem_get_info`` reports what the *driver* has left, which is what we want: caching
+    into memory another process is already using would just cause an OOM later. The Apple MPS and
+    CPU backends have no comparable per-device query, so they return None and callers fall back to
+    disabling that cache tier.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device = device if device is not None else default_device()
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        free, _total = torch.cuda.mem_get_info(index)
+        return int(free)
+    except Exception:  # noqa: BLE001 - a missing driver must not break model construction
+        return None
+
+
+def total_device_bytes(device=None):
+    """Total memory on ``device`` in bytes, or None when unknown."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device = device if device is not None else default_device()
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        return int(torch.cuda.get_device_properties(index).total_memory)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def total_host_bytes():
+    """Total physical RAM in bytes, or None when it cannot be read."""
+    try:
+        import os
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+    except Exception:  # noqa: BLE001 - not available on Windows / some containers
+        pass
+    try:
+        with open('/proc/meminfo') as fh:
+            for line in fh:
+                if line.startswith('MemTotal:'):
+                    return int(line.split()[1]) * 1024
+    except Exception:  # noqa: BLE001
+        return None
+
+
+
+
 def _decompress_device(device):
     """Device to run a block-wise dequantization on.
 
     bitsandbytes' dequantize kernels are CUDA-only (an MPS build falls back to plain torch
     anyway), so on a machine without CUDA there is no choice to make. Everywhere else the
     caller's device is used instead of a hardcoded ``cuda`` -- which used to send a CPU-only run
-    straight to an assertion error, making the 4bit/8bit codecs unusable off NVIDIA hardware.
+    straight to an assertion error.
     """
     if device is not None:
         resolved = torch.device(device)
@@ -469,14 +693,37 @@ def load_layer_subset(local_path, layer_name, keys):
     return out
 
 
-def load_layer(local_path, layer_name, profiling=False):
+def load_layer(local_path, layer_name, profiling=False, device=None, decompress=True):
+    """Read one module's shard.
+
+    ``decompress=False`` returns the shard exactly as stored (still quantized). It exists so the
+    prefetch thread can do the disk read, which is the part worth overlapping, without also
+    materializing or transferring the weights: two decompressed layers alive at once would defeat
+    the memory saving compression is used for.
+    """
     #layer_state_dict = load_file(Path(local_path) / (layer_name + ".safetensors"), device="cpu")
     layer_state_dict = ModelPersister.get_model_persister().load_model(layer_name, local_path)
 
     if profiling:
         t = time.process_time()
 
-    to_return = uncompress_layer_state_dict(layer_state_dict)
+    # A shard written by the codec engine carries its own description. Resolve it here rather than
+    # at the call site so every reader -- the streaming hook, the prefetch thread, the MLX backend
+    # -- goes through the same inverse. ``decompress=False`` is the prefetch path: it wants the
+    # packed bytes, which is exactly what the disk already holds.
+    from .codecs import META_KEY, decode_state_dict, read_codec_meta
+    meta = read_codec_meta(layer_state_dict)
+    if meta is not None:
+        layer_state_dict = {k: v for k, v in layer_state_dict.items() if k != META_KEY}
+        if not decompress:
+            return (layer_state_dict, 0.0) if profiling else layer_state_dict
+        to_return = decode_state_dict(layer_state_dict, meta, device=device)
+        if profiling:
+            return to_return, time.process_time() - t
+        return to_return
+
+    to_return = (uncompress_layer_state_dict(layer_state_dict, device=device)
+                 if decompress else layer_state_dict)
 
     #clean_memory()
 
@@ -531,8 +778,11 @@ def compress_layer_state_dict(layer_state_dict, compression=None, device=None):
                 compressed_layer_state_dict[k + ".4bit." + quant_state_k] = quant_state_v
     elif compression == '8bit':
         compressed_layer_state_dict = {}
+        # Dequantization must reproduce the *stored* dtype, so 8bit always dequantizes to fp16.
+        # Quantizing from fp16 as well keeps rounding consistent on both ends.
         for k, v in layer_state_dict.items():
-            v_quant, quant_state = bnb.functional.quantize_blockwise(v.to(target).to(torch.float16), blocksize=2048)
+            v_quant, quant_state = bnb.functional.quantize_blockwise(v.to(target).to(torch.float16),
+                                                                    blocksize=2048)
             absmax = quant_state.absmax.clone().contiguous()
             code = quant_state.code.clone().contiguous()
             compressed_layer_state_dict[k] = v_quant
@@ -579,14 +829,29 @@ def link_or_copy_file(src, dst):
 
 
 def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model',
-                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None):
+                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None,
+                          config=None, compression_device=None, codec=None, size_budget_gb=None,
+                          allow_lossy=None):
     """
     Save the all layers of a model sharded checkpoint using safetensors.
+
+    ``layer_names`` describes which modules exist. When it does not match what the checkpoint
+    contains (a family whose trunk is called ``transformer`` or ``gpt_neox`` rather than
+    ``model``), and ``config`` is supplied, the layout is discovered from the config instead of
+    producing a split that the runtime cannot load.
     """
 
     if compression is not None:
         assert bitsandbytes_installed, f"when using compression bitsandbytes has to be installed."
         splitted_model_dir_name = splitted_model_dir_name + "." + compression
+
+    # A codec split is a different on-disk layout, so it gets its own directory: reusing the plain
+    # one would let a half-written codec split be mistaken for a complete one (and vice versa).
+    codec_plan = None
+    if codec is not None:
+        from .codecs import plan_codecs
+        codec_plan = plan_codecs(codec, size_budget_gb=size_budget_gb, allow_lossy=allow_lossy)
+        splitted_model_dir_name = splitted_model_dir_name + ".codec-" + codec_plan.default
 
     checkpoint_path = Path(checkpoint_path)
 
@@ -597,6 +862,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         saving_path = Path(layer_shards_saving_path) / splitted_model_dir_name
 
 
+    declared_resident = []
     # Build a weight_map (param name -> file that stores it). Multi-shard checkpoints ship an
     # index.json; small/modern models often ship a single file with no index, so synthesize one.
     safetensors_format = False
@@ -624,6 +890,12 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             f"No model weights found under {checkpoint_path}. Expected one of: "
             f"model.safetensors(.index.json) or pytorch_model.bin(.index.json).")
 
+    if layer_names is not None and config is not None:
+        saving_root = (Path(layer_shards_saving_path) / splitted_model_dir_name
+                       if layer_shards_saving_path is not None
+                       else checkpoint_path / splitted_model_dir_name)
+        layer_names = derive_layer_names_dict(layer_names, config, saving_root)
+
     if layer_names is None:
         n_layers = len(set([int(k.split('.')[2]) for k in index.keys() if 'model.layers' in k]))
     else:
@@ -632,20 +904,25 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     if layer_names is None:
         layers = ['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)] + ['model.norm.', 'lm_head.']
     else:
-        layers = [layer_names['embed']] + [f'{layer_names["layer_prefix"]}.{i}' for i in range(n_layers)] + [layer_names['norm'], layer_names['lm_head']]
+        layers = ([layer_names['embed']] + list(layer_names.get('prefix_modules', []))
+                  + [f'{layer_names["layer_prefix"]}.{i}' for i in range(n_layers)]
+                  + [layer_names['norm'], layer_names['lm_head']])
 
         if 'rotary_pos_emb' in layer_names:
             layers = [layer_names['rotary_pos_emb']] + layers
         # Modules that are not part of the streamed sequence but still need their weights on disk,
         # e.g. a multimodal model's vision tower / projector, or extra top-level norms. They get
         # their own shard and are loaded once and kept resident.
-        layers = layers + list(layer_names.get('resident', []))
+        declared_resident = [r.rstrip('.') for r in layer_names.get('resident', [])]
+        layers = layers + declared_resident
         layers = layers + cpu_resident_module_names(layer_names, index.keys())
         layers = [l + "." for l in layers]
 
     # Drop layers that have no weights in the checkpoint. This happens for tied embeddings,
-    # where lm_head shares storage with embed_tokens and has no entry of its own. Without this we
-    # would try to save an empty shard (which fails) and never detect the split as complete.
+    # where lm_head shares storage with embed_tokens and has no entry of its own, and for a
+    # layout slot that is intentionally empty (a "stateless norm" placeholder for architectures
+    # with no final norm). Without this we would try to save an empty shard (which fails) and
+    # never detect the split as complete.
     layers = [l for l in layers if any(k.startswith(l) for k in index.keys())]
     owned = {layer_owner(k, layers) for k in index}
     layers = [l for l in layers if l in owned]
@@ -764,7 +1041,27 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         # Optionnally load next shard
         # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
         shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
-        if len(shards) > 0:
+        if len(shards) > 0 and max(shards) <= shard and \
+                not any(k.startswith(layer) for k in state_dict):
+            # This module's tensors are in a shard the cursor has already walked past (possible
+            # once non-sequential modules such as a trunk-level norm are in the list) and nothing
+            # of it is still buffered. Rather than silently writing an empty shard -- which leaves
+            # those tensors in no shard at all -- re-read the one file that holds them.
+            owner_file = checkpoint_path / index[next(k for k in index if k.startswith(layer))]
+            if not owner_file.exists():
+                assert repo_id is not None
+                huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(owner_file),
+                                                  token=hf_token)
+            if not safetensors_format:
+                loaded = torch.load(owner_file, map_location='cpu')
+            else:
+                loaded = load_file(owner_file, device='cpu')
+            marker = (layer_names or {}).get('cpu_resident_marker')
+            if marker:
+                loaded = {k: v for k, v in loaded.items() if marker not in k}
+            state_dict.update(loaded)
+
+        if len(shards) > 0 and max(shards) > shard:
             # A layer can span several shards (especially fp8 checkpoints, where each weight has a
             # companion weight_scale_inv tensor). Load *every* shard up to the highest one this layer
             # references, not just the next one -- otherwise the layer is saved missing some tensors
@@ -816,10 +1113,32 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
         # Get layer state dict. Longest prefix wins, so e.g. a PLE n-gram table nested under a
         # decoder layer is not written into that layer's shard (and later streamed onto the GPU).
+        # A module whose tensors live in an *earlier* shard than the one we are currently holding
+        # would otherwise be lost, so ownership is computed against everything loaded so far.
         layer_state_dict = dict([(k, v) for k, v in state_dict.items()
                                  if layer_owner(k, layers) == layer])
+        # A discovered resident table (GPT-2's ``wpe``) lives beside the embedding, so prefix
+        # matching would otherwise be fine -- but a trunk-level final norm whose tensors arrive
+        # after the block that precedes it would be swallowed by the last block's shard. Pull
+        # exactly the declared resident prefixes into their own shard.
+        resident_owned = set()
+        for resident in declared_resident:
+            prefix = resident + '.'
+            if layer_state_dict and layer != resident:
+                layer_state_dict = {k: v for k, v in layer_state_dict.items()
+                                    if not k.startswith(prefix)}
+            if layer == resident or layer == resident + '.':
+                extra = {k: v for k, v in state_dict.items() if k.startswith(prefix)}
+                resident_owned.update(extra)
+                layer_state_dict.update(extra)
 
-        layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+        if codec_plan is not None:
+            from .codecs import META_KEY, encode_state_dict, shard_meta_bytes
+            layer_state_dict, codec_meta = encode_state_dict(layer_state_dict, codec_plan)
+            layer_state_dict[META_KEY] = shard_meta_bytes(codec_meta)
+        else:
+            layer_state_dict = compress_layer_state_dict(layer_state_dict, compression,
+                                                         device=compression_device)
 
         # Save layer state dict as using safetensors
 
@@ -828,7 +1147,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
 
         # Free memory
-        for k in layer_state_dict.keys():
+        for k in list(layer_state_dict.keys()) + list(resident_owned):
             if k in state_dict:
                 del state_dict[k]
         del layer_state_dict
@@ -844,7 +1163,9 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     return str(saving_path)
 
 def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None, compression=None,
-                                       layer_names=None, hf_token=None, delete_original=False):
+                                       layer_names=None, hf_token=None, delete_original=False, config=None,
+                                       compression_device=None, codec=None, size_budget_gb=None,
+                                       allow_lossy=None):
     """
     find the model's local cache path, download the cache if not exists, then split and save the model.
 
@@ -877,7 +1198,11 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
         if any(os.path.exists(Path(model_local_path_or_repo_id) / f) for f in local_weight_files):
             print(f"found local checkpoint...")
             return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
-                                                                            compression=compression, layer_names=layer_names, delete_original=delete_original)
+                                                                            compression=compression, layer_names=layer_names, delete_original=delete_original,
+                                                                            config=config,
+                                                                            compression_device=compression_device,
+                                                                            codec=codec, size_budget_gb=size_budget_gb,
+                                                                            allow_lossy=allow_lossy)
         else:
             print(
                 f"Found local directory in {model_local_path_or_repo_id}, but didn't find downloaded model. Try using {model_local_path_or_repo_id} as a HF repo...")
@@ -920,4 +1245,8 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     # if splitted_model subdir exists under cache use it, otherwise split and save
     return Path(hf_cache_path), split_and_save_layers(hf_cache_path, layer_shards_saving_path,
                                                       compression=compression, layer_names=layer_names,
-                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id, hf_token=hf_token)
+                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id,
+                                                      hf_token=hf_token, config=config,
+                                                      compression_device=compression_device,
+                                                      codec=codec, size_budget_gb=size_budget_gb,
+                                                      allow_lossy=allow_lossy)

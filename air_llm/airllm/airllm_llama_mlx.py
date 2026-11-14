@@ -233,9 +233,16 @@ class AirLLMLlamaMlx:
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, test_nonlayered=False, show_memory_util=False,
-                 delete_original=False):
+                 delete_original=False, layer_cache_gb=None):
 
         self.hf_token = hf_token
+        # MLX runs on unified memory, so "device" and "host" are the same pool. A cached layer
+        # therefore skips the .npz load+update for free in the same way, and the only question is
+        # how much RAM to hold. Default: cache when the checkpoint fits comfortably (<= 25% of
+        # available memory), otherwise stream as before.
+        self.layer_cache_gb = layer_cache_gb
+        self._layer_cache = {}
+        self._layer_cache_order = []
         self.set_layer_names_dict()
         self.test_nonlayered = test_nonlayered
         self.show_memory_util = show_memory_util
@@ -264,6 +271,52 @@ class AirLLMLlamaMlx:
 
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
+        self._layer_cache_budget = self._resolve_layer_cache_budget()
+        self._layer_bytes = self._estimate_layer_bytes()
+        if self._layer_cache_budget > 0:
+            print(f"MLX layer cache: {self._layer_cache_budget / 1024 ** 3:.1f}GB "
+                  f"(layer ~{self._layer_bytes / 1024 ** 2:.0f}MB)")
+
+    def _resolve_layer_cache_budget(self):
+        if self.layer_cache_gb is not None:
+            return int(max(0.0, float(self.layer_cache_gb)) * 1024 ** 3)
+        available = psutil.virtual_memory().available
+        # Cache only if the whole checkpoint fits in a quarter of free RAM: the point is to make
+        # repeat passes free without ever making the machine swap.
+        total = len(self.layer_names) * self._estimate_layer_bytes()
+        if total <= available * 0.25:
+            return int(total)
+        return 0
+
+    def _estimate_layer_bytes(self):
+        """Bytes in one decoder-layer shard (or 0 when the files are not there yet)."""
+        for name in self.layer_names:
+            if '.layers.' not in name:
+                continue
+            for suffix in ('.safetensors', '.mlx.npz'):
+                path = Path(self.checkpoint_path) / (name + suffix)
+                if path.exists():
+                    return path.stat().st_size
+            return 0
+        return 0
+
+    def _cached_layer(self, name):
+        if name in self._layer_cache:
+            self._layer_cache_order.remove(name)
+            self._layer_cache_order.append(name)
+            return self._layer_cache[name]
+        return None
+
+    def _store_layer(self, name, layer):
+        """Keep a loaded layer in RAM, evicting the least-recently-used one past the budget."""
+        budget = self._layer_cache_budget
+        if budget <= 0 or self._layer_bytes <= 0 or self._layer_bytes > budget:
+            return
+        while (len(self._layer_cache) + 1) * self._layer_bytes > budget and self._layer_cache_order:
+            oldest = self._layer_cache_order.pop(0)
+            self._layer_cache.pop(oldest, None)
+        self._layer_cache[name] = layer
+        self._layer_cache_order.append(name)
 
     def get_tokenizer(self, hf_token=None):
         if hf_token is not None:
@@ -327,11 +380,17 @@ class AirLLMLlamaMlx:
 
         for il in tqdm(range(self.model_args.n_layers), desc='running layers'):
             self.record_memory(f'before layer {il}')
-            l = TransformerBlock(args=self.model_args)
-            l.update(
-                ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
-                                                                     self.checkpoint_path)['layers'][il]
-            )
+            layer_name = f'{self.layer_names_dict["layer_prefix"]}.{il}'
+            l = self._cached_layer(layer_name)
+            reused = l is not None
+            if l is None:
+                l = TransformerBlock(args=self.model_args)
+                l.update(
+                    ModelPersister.get_model_persister().load_model(layer_name,
+                                                                   self.checkpoint_path)['layers'][il]
+                )
+                # Only the prompt pass pays for the cache fill; every later token is a pure hit.
+                self._store_layer(layer_name, l)
 
             x, c = l(x, mask=mask)
             # force execution
@@ -340,7 +399,8 @@ class AirLLMLlamaMlx:
             cache.append(c)
 
             if not self.test_nonlayered:
-                del l
+                if not reused:
+                    del l
                 gc.collect()
             else:
                 self.layers.append(l)
@@ -417,10 +477,17 @@ class AirLLMLlamaMlx:
                 # the computation will happen, MLX will be discarding the
                 # old cache the moment it is not needed anymore.
 
+                reused = False
                 if not self.test_nonlayered:
-                    l = TransformerBlock(args=self.model_args)
-                    l.update(ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{i}',
-                                                                             self.checkpoint_path)['layers'][i])
+                    layer_name = f'{self.layer_names_dict["layer_prefix"]}.{i}'
+                    l = self._cached_layer(layer_name)
+                    reused = l is not None
+                    if l is None:
+                        l = TransformerBlock(args=self.model_args)
+                        l.update(ModelPersister.get_model_persister().load_model(layer_name,
+                                                                                self.checkpoint_path)['layers'][i])
+                        # Retain it so the next decoded token does not reload this shard.
+                        self._store_layer(layer_name, l)
                 else:
                     l = self.layers[i]
 
@@ -428,7 +495,8 @@ class AirLLMLlamaMlx:
                 # force execution
                 mx.eval(x)
                 if not self.test_nonlayered:
-                    del l
+                    if not reused:
+                        del l
                     gc.collect()
                 self.record_memory(f'after layer {il}')
 

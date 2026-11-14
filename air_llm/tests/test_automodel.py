@@ -1,31 +1,47 @@
-import sys
 import unittest
-
-#sys.path.insert(0, '../airllm')
 
 from ..airllm.auto_model import AutoModel
 
 
-
 class TestAutoModel(unittest.TestCase):
-    def setUp(self):
-        pass
-    def tearDown(self):
-        pass
+    """Architecture -> class mapping.
 
-    def test_auto_model_should_return_correct_model(self):
-        mapping_dict = {
-            'garage-bAInd/Platypus2-7B': 'AirLLMLlama2',
-            'Qwen/Qwen-7B': 'AirLLMQWen',
-            'internlm/internlm-chat-7b': 'AirLLMInternLM',
-            'THUDM/chatglm3-6b-base': 'AirLLMChatGLM',
-            'baichuan-inc/Baichuan2-7B-Base': 'AirLLMBaichuan',
-            'mistralai/Mistral-7B-Instruct-v0.1': 'AirLLMMistral',
-            'mistralai/Mixtral-8x7B-v0.1': 'AirLLMMixtral'
-        }
+    This used to call ``get_module_class(repo_id)``, which downloads each checkpoint's config
+    from the Hub. The mapping itself is pure, so it is tested directly: a unit test should not
+    depend on the network (it failed for exactly that reason on an offline runner).
+    """
+
+    MAPPING = {
+        'LlamaForCausalLM': 'AirLLMBaseModel',
+        'Qwen2ForCausalLM': 'AirLLMBaseModel',
+        'MistralForCausalLM': 'AirLLMBaseModel',
+        'MixtralForCausalLM': 'AirLLMBaseModel',
+        'DeepseekV3ForCausalLM': 'AirLLMBaseModel',
+        'QWenLMHeadModel': 'AirLLMQWen',
+        'InternLMForCausalLM': 'AirLLMInternLM',
+        'ChatGLMModel': 'AirLLMChatGLM',
+        'ChatGLMForConditionalGeneration': 'AirLLMChatGLM',
+        'BaichuanForCausalLM': 'AirLLMBaichuan',
+        'BaiChuanForCausalLM': 'AirLLMBaichuan',
+        'KimiK3ForConditionalGeneration': 'AirLLMKimiK3',
+        'Qwen3_5ForConditionalGeneration': 'AirLLMQwen3_5',
+        'Qwen4ExpForConditionalGeneration': 'AirLLMQwen4Exp',
+    }
+
+    def test_architecture_maps_to_expected_class(self):
+        for arch, expected in self.MAPPING.items():
+            got = AutoModel.class_name_for_architecture(arch)
+            self.assertEqual(got, expected, f"expecting {expected} for {arch}")
+
+    def test_unknown_architecture_uses_the_generic_streaming_path(self):
+        self.assertEqual(AutoModel.class_name_for_architecture('SomeBrandNewForCausalLM'),
+                         'AirLLMBaseModel')
+        self.assertEqual(AutoModel.class_name_for_architecture(''), 'AirLLMBaseModel')
+
+    def test_cannot_be_instantiated_directly(self):
+        with self.assertRaises(EnvironmentError):
+            AutoModel()
 
 
-        for k,v in mapping_dict.items():
-            module, cls = AutoModel.get_module_class(k)
-            self.assertEqual(cls, v, f"expecting {v}")
-
+if __name__ == '__main__':
+    unittest.main()

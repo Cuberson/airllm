@@ -13,6 +13,8 @@ v1 is text-only Qwen3.5 / Qwen3.8. Vision stays on meta. Dropout is 0 so the
 backward recompute matches the forward.
 """
 
+from pathlib import Path
+
 from accelerate.utils.modeling import set_module_tensor_to_device
 import torch
 import torch.nn.functional as F
@@ -190,6 +192,7 @@ class AirLLMLoRA(AirLLMQwen3_5):
         return len(self.layers) - 3
 
     def _materialize(self, stream_idx):
+        self._track_layer_size(stream_idx)
         if self.prefetching and self._prefetch_future is not None and self._prefetched_idx == stream_idx:
             state = self._prefetch_future.result()
             self._prefetch_future = None
@@ -203,11 +206,27 @@ class AirLLMLoRA(AirLLMQwen3_5):
         module._airllm_moved = self.move_layer_to_device(state)
 
     def _evict(self, stream_idx):
+        # Training streams through the model twice per step (forward and recompute in backward),
+        # so this runs 2 * n_layers times per optimizer step. A full gc/allocator flush here costs
+        # tens of milliseconds and buys nothing: the next layer's load reuses the same blocks, and
+        # CUDA's caching allocator already keeps them. Flush only when memory is actually tight.
         module = self.layers[stream_idx]
         for param_name in getattr(module, "_airllm_moved", []):
             set_module_tensor_to_device(self.model, param_name, "meta")
         module._airllm_moved = []
-        clean_memory()
+        if self._should_flush_after_evict():
+            clean_memory()
+
+    def _should_flush_after_evict(self):
+        """Flush the allocator only when free VRAM is too low to hold the next layer."""
+        if not torch.cuda.is_available():
+            return False
+        try:
+            free = torch.cuda.mem_get_info()[0]
+            reserve = max(getattr(self, "_layer_bytes_max", 0), 512 * 1024 ** 2)
+            return free < reserve
+        except Exception:  # noqa: BLE001 - never block training on a probe failure
+            return True
 
     def _prefetch_stream(self, stream_idx):
         if not self.prefetching or self._executor is None:
@@ -217,6 +236,15 @@ class AirLLMLoRA(AirLLMQwen3_5):
         self._prefetch_future = self._executor.submit(
             self.load_layer_to_cpu, self.layer_names[stream_idx])
         self._prefetched_idx = stream_idx
+
+    def _track_layer_size(self, stream_idx):
+        """Remember the biggest layer seen, so ``_evict`` can size its memory reserve."""
+        try:
+            path = Path(self.checkpoint_path) / (self.layer_names[stream_idx] + '.safetensors')
+            size = path.stat().st_size
+        except OSError:
+            return
+        self._layer_bytes_max = max(getattr(self, '_layer_bytes_max', 0), size)
 
     def _stream_idx_for_kind(self, kind):
         if kind[0] == "decoder":

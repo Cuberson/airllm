@@ -19,6 +19,8 @@ else:
     # ``airllm.utils``, which broke ``from airllm import uncompress_layer_state_dict`` (the
     # documented way to inspect a compressed shard) and the project's own compression test.
     from .utils import compress_layer_state_dict, uncompress_layer_state_dict
+    from .layer_cache import StreamedLayerCache
+    from .progress import ProgressReporter, Throughput
     # The codec engine: the lossless/lossy compression layer and the planner that picks between
     # them. Exported so callers can size a checkpoint before downloading it (``suggest_codec``,
     # ``estimate_bytes``) and so a shard can be inspected without going through a model.

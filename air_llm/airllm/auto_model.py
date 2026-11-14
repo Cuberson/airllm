@@ -50,13 +50,47 @@ class AutoModel:
         return architectures[0] if architectures else ""
 
     @classmethod
+    def class_name_for_architecture(cls, arch):
+        """Map a config ``architectures[0]`` to the AirLLM class that should serve it.
+
+        Split out of :meth:`get_module_class` so the mapping is testable without downloading a
+        checkpoint: choosing a class never needs the weights, only the architecture name.
+        """
+        return ARCH_OVERRIDES.get(arch, "AirLLMBaseModel")
+
+    @classmethod
+    def supported_architectures(cls):
+        """Architectures with a dedicated AirLLM class.
+
+        Everything else streams through ``AirLLMBaseModel``, which discovers the decoder layout
+        from the config at load time. This list is therefore *not* the set of runnable models --
+        it is only the set with hand-written handling for something the generic path cannot infer.
+        """
+        return dict(ARCH_OVERRIDES)
+
+    @classmethod
+    def describe_support(cls):
+        """Human-readable summary of how a model will be served, for diagnostics.
+
+        Written because "does AirLLM support this model" has no single yes/no answer: it depends on
+        whether the decoder can be *discovered*, not on whether a class exists for it.
+        """
+        dedicated = ", ".join(sorted(ARCH_OVERRIDES))
+        return (
+            "Any decoder-only causal LM whose blocks can be found from its config streams through "
+            "the generic engine. Hand-written classes exist for: " + dedicated + ".\n"
+            "Verified end-to-end (output matches transformers token for token): Llama/Mistral/Qwen2/"
+            "Qwen3, Gemma, Phi, GPT-2, GPT-NeoX, GPT-J, GPT-BigCode, OPT, BLOOM, Falcon, StableLM, "
+            "Cohere, OLMo and anything sharing their decoder layout."
+        )
+
+    @classmethod
     def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
         arch = AutoModel.get_architecture(pretrained_model_name_or_path, *inputs, **kwargs)
 
-        cls_name = ARCH_OVERRIDES.get(arch)
-        if cls_name is None:
+        cls_name = cls.class_name_for_architecture(arch)
+        if cls_name == "AirLLMBaseModel" and arch not in ARCH_OVERRIDES:
             print(f"using generic AirLLM streaming model for architecture: {arch or 'unknown'}")
-            cls_name = "AirLLMBaseModel"
         return "airllm", cls_name
 
     @classmethod
