@@ -35,6 +35,9 @@ setuptools.setup(
         'safetensors',
         'huggingface-hub',
         'scipy',
+        # The codec's bit packing goes through np.packbits/np.unpackbits, which are ~7-12x faster
+        # than the equivalent tensor ops and are what make a compressed shard usable at run time.
+        'numpy',
         'sentencepiece',
         # 'bitsandbytes' is optional (used only for --compression); we fall back gracefully when absent.
         # 'compressed-tensors' is optional too: only checkpoints stored in that format (Kimi K3's

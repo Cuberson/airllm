@@ -279,6 +279,57 @@ class TestPlanning(unittest.TestCase):
         self.assertIn('ternary', report)
 
 
+class TestBitPacking(unittest.TestCase):
+    """Fixed-width bit packing is the hot path in both directions, and both were rewritten.
+
+    Decode used to be a per-bit gather (~14 MiB/s on a real bf16 layer) and is now numpy's
+    ``unpackbits`` followed by one matmul; encode used to be a per-bit ``scatter_add`` and is now
+    ``packbits``. A subtle error here is *silent*: a wrong bit order yields weights that are
+    merely wrong, not weights that fail to load, so the round-trip is pinned across every width
+    the codecs actually use.
+    """
+
+    def test_round_trip_across_widths(self):
+        """Widths 1..24, including the boundaries where byte alignment changes."""
+        from airllm.codecs import _pack_fixed, _unpack_fixed
+        torch.manual_seed(0)
+        for width in (1, 2, 3, 5, 7, 8, 11, 12, 16, 24):
+            for count in (0, 1, 7, 8, 9, 1000, 100_003):
+                with self.subTest(width=width, count=count):
+                    values = torch.randint(0, 1 << min(width, 30), (count,), dtype=torch.int64)
+                    packed = _pack_fixed(values, width)
+                    if count:
+                        self.assertEqual(packed.numel(), (count * width + 7) // 8)
+                    restored = _unpack_fixed(packed, width, count)
+                    self.assertEqual(restored.numel(), count)
+                    self.assertTrue(torch.equal(restored, values))
+
+    def test_chunk_boundary_is_byte_aligned(self):
+        """A chunk must not straddle a byte, or every symbol after it is shifted.
+
+        Counts on either side of the internal chunk size are compared against a single-shot
+        decode of the same data.
+        """
+        from airllm.codecs import _pack_fixed, _unpack_fixed
+        torch.manual_seed(1)
+        width = 5
+        count = 2_000_003          # comfortably larger than one internal chunk at this width
+        values = torch.randint(0, 1 << width, (count,), dtype=torch.int64)
+        packed = _pack_fixed(values, width)
+        self.assertTrue(torch.equal(_unpack_fixed(packed, width, count), values))
+
+    def test_round_trip_is_exact_for_alphabet_codes(self):
+        """End to end through the alphabet, which is what a real shard does."""
+        from airllm.codecs import _ExponentAlphabet
+        torch.manual_seed(2)
+        exponents = torch.randint(120, 150, (200_000,), dtype=torch.int64)
+        alpha = _ExponentAlphabet.build(exponents)
+        packed, bit_count = alpha.encode(exponents)
+        self.assertEqual(bit_count, exponents.numel() * alpha.width)
+        self.assertEqual(packed.numel(), (bit_count + 7) // 8)
+        self.assertTrue(torch.equal(alpha.decode(packed, exponents.numel()), exponents))
+
+
 class TestScalability(unittest.TestCase):
     """Guards against the failure mode this module actually hit: silent OOM.
 

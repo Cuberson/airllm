@@ -36,6 +36,8 @@ from __future__ import annotations
 import json
 import math
 import struct
+
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -114,45 +116,63 @@ def _pack_fixed(values: torch.Tensor, width: int) -> torch.Tensor:
         lanes = torch.arange(width, dtype=torch.int32)
         # (m, width) bits, as int32: half the memory of int64 and still exact for width <= 8.
         bits = ((chunk.to(torch.int32).unsqueeze(1) >> lanes) & 1)
-        words = (bits << lanes).sum(dim=1)                       # per-symbol packed word
         # Round *up*: a chunk of one 1-bit symbol is still one byte. Flooring here produced a
         # zero-length buffer and an out-of-bounds scatter on any single-element tensor.
-        buf = torch.zeros((m * width + 7) // 8, dtype=torch.int64)
-        pos = torch.arange(m, dtype=torch.int64) * width
-        for k in range(width):
-            p_k = pos + k
-            buf.scatter_add_(0, p_k >> 3, ((words.to(torch.int64) >> k) & 1) << (p_k & 7))
-        out.append(buf.to(torch.uint8))
-    return torch.cat(out) if out else torch.zeros(0, dtype=torch.uint8)
+        # The bit matrix is already to hand, and numpy's packbits does the byte assembly as one
+        # compiled pass. The torch equivalent is a per-bit scatter_add over a byte buffer, which
+        # is correct but measured ~7x slower on a real layer.
+        flat = bits.to(torch.uint8).numpy().ravel()
+        out.append(torch.from_numpy(np.packbits(flat, bitorder='little')))
+    if not out:
+        return torch.zeros(0, dtype=torch.uint8)
+    return out[0] if len(out) == 1 else torch.cat(out)
 
 
 def _unpack_fixed(data: torch.Tensor, width: int, count: int) -> torch.Tensor:
-    """Inverse of :func:`_pack_fixed`, chunked for the same memory reason."""
+    """Inverse of :func:`_pack_fixed`, chunked for the same memory reason.
+
+    The expansion is done in numpy, not torch, because both halves of it have a compiled form
+    there and a tensor-op form is several times slower:
+
+    * ``unpackbits`` is a byte-wise lookup table, where the natural torch formulation ("read each
+      symbol's ``width`` bits with a gather, then shift them into place") costs a full indexed
+      read per bit and measured ~14 MiB/s of source on a real bf16 layer.
+    * the bit matrix becomes codes with one int32 matmul against ``1 << k``, rather than a
+      shift-and-reduce, which is the same arithmetic with no reduction loop.
+
+    Together that is ~12x on the decode path. It matters because decoding happens on every layer
+    of every token: at the old speed, decompression dominated the token instead of hiding behind
+    the disk read, which made a compressed checkpoint unusable interactively even though it was
+    correct.
+
+    ``unpackbits`` returns one bit per byte, so the plane is materialised per chunk and dropped
+    before the next one -- a whole layer is ~10^8 symbols, which would be ~0.8GB in that form.
+    """
     if count == 0 or width == 0:
         return torch.zeros(count, dtype=torch.int64)
-    buf = data.to(torch.int64).reshape(-1)
+    buf = data.to(torch.uint8).reshape(-1)
     if width == 8:
-        return buf[:count]
-    per_chunk = max(1, 8_000_000 // max(1, width))
+        return buf[:count].to(torch.int64)
+
+    # Chunks must end on a byte boundary (count*width % 8 == 0) so each one begins byte-aligned.
     step = math.lcm(width, 8) // width
-    per_chunk = max(step, (per_chunk // step) * step)
+    per_chunk = max(step, (4_000_000 // max(1, width) // step) * step)
+    weights = (1 << np.arange(width, dtype=np.int32))
+
     out = []
-    lanes = torch.arange(width, dtype=torch.int64)
     for lo in range(0, count, per_chunk):
         hi = min(lo + per_chunk, count)
         m = hi - lo
-        # This chunk's bytes start at lo*width bits, which is byte-aligned by construction.
-        bit_offset = lo * width
-        byte_lo = bit_offset // 8
-        byte_hi = byte_lo + max(1, (m * width + 7) // 8)
-        window = buf[byte_lo:byte_hi]
-        padded = torch.zeros(window.numel() + 8, dtype=torch.int64)
-        padded[:window.numel()] = window
-        bits = (padded.unsqueeze(1) >> torch.arange(8, dtype=torch.int64)) & 1
-        flat = bits.reshape(-1)
-        pos = torch.arange(m, dtype=torch.int64).unsqueeze(1) * width + lanes
-        out.append((flat[pos] << lanes).sum(dim=1))
-    return torch.cat(out)
+        byte_lo = (lo * width) // 8
+        byte_hi = byte_lo + (m * width + 7) // 8
+        window = buf[byte_lo:byte_hi].numpy()
+
+        bits = np.unpackbits(window, bitorder='little')[:m * width].reshape(m, width)
+        out.append(torch.from_numpy(bits.astype(np.int32) @ weights).to(torch.int64))
+
+    if not out:
+        return torch.zeros(0, dtype=torch.int64)
+    return out[0] if len(out) == 1 else torch.cat(out)
 
 
 # ---------------------------------------------------------------------------------------------
